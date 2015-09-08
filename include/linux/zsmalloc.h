@@ -26,6 +26,11 @@ enum zs_mapmode {
 	ZS_MM_WO /* write-only (no copy-in at map time) */
 };
 
+struct zs_pool_stats {
+	/* How many objects were migrated */
+	unsigned long num_migrated;
+};
+
 struct zs_pool;
 
 struct zs_pool *zs_create_pool(char *name, gfp_t flags);
@@ -40,4 +45,5 @@ void zs_unmap_object(struct zs_pool *pool, unsigned long handle);
 
 unsigned long zs_get_total_pages(struct zs_pool *pool);
 
+void zs_pool_stats(struct zs_pool *pool, struct zs_pool_stats *stats);
 #endif

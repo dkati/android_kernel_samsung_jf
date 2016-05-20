@@ -205,8 +205,6 @@ struct link_free {
 struct zs_pool {
 	struct size_class size_class[ZS_SIZE_CLASSES];
 
-	gfp_t flags;	/* allocation flags used when growing pool */
-
 	atomic_long_t pages_allocated;
 
 	struct zs_pool_stats stats;
@@ -245,14 +243,18 @@ struct mapping_area {
 	enum zs_mapmode vm_mm; /* mapping mode */
 };
 
-
 /* zpool driver */
 
 #ifdef CONFIG_ZPOOL
 
 static void *zs_zpool_create(char *name, gfp_t gfp, struct zpool_ops *zpool_ops)
 {
-	return zs_create_pool(name, gfp);
+	/*
+	 * Ignore global gfp flags: zs_malloc() may be invoked from
+	 * different contexts and its caller must provide a valid
+	 * gfp mask.
+	 */
+	return zs_create_pool(name);
 }
 
 static void zs_zpool_destroy(void *pool)
@@ -263,7 +265,7 @@ static void zs_zpool_destroy(void *pool)
 static int zs_zpool_malloc(void *pool, size_t size, gfp_t gfp,
 			unsigned long *handle)
 {
-	*handle = zs_malloc(pool, size);
+	*handle = zs_malloc(pool, size, gfp);
 	return *handle ? 0 : -1;
 }
 static void zs_zpool_free(void *pool, unsigned long handle)
@@ -958,7 +960,7 @@ EXPORT_SYMBOL_GPL(zs_destroy_pool);
  * otherwise 0.
  * Allocation requests with size > ZS_MAX_ALLOC_SIZE will fail.
  */
-unsigned long zs_malloc(struct zs_pool *pool, size_t size)
+unsigned long zs_malloc(struct zs_pool *pool, size_t size, gfp_t gfp)
 {
 	unsigned long obj;
 	struct link_free *link;
@@ -968,7 +970,9 @@ unsigned long zs_malloc(struct zs_pool *pool, size_t size)
 	struct page *first_page, *m_page;
 	unsigned long m_objidx, m_offset;
 
-	if (unlikely(!size || size > ZS_MAX_ALLOC_SIZE))
+
+	handle = alloc_handle(pool, gfp);
+	if (!handle)
 		return 0;
 
 	class_idx = get_size_class_index(size);
@@ -980,8 +984,10 @@ unsigned long zs_malloc(struct zs_pool *pool, size_t size)
 
 	if (!first_page) {
 		spin_unlock(&class->lock);
-		first_page = alloc_zspage(class, pool->flags);
-		if (unlikely(!first_page))
+
+		first_page = alloc_zspage(class, gfp);
+		if (unlikely(!first_page)) {
+			free_handle(pool, handle);
 			return 0;
 
 		set_zspage_mapping(first_page, class->index, ZS_EMPTY);
@@ -1371,7 +1377,8 @@ EXPORT_SYMBOL_GPL(zs_pool_stats);
  * On success, a pointer to the newly created pool is returned,
  * otherwise NULL.
  */
-struct zs_pool *zs_create_pool(char *name, gfp_t flags)
+
+struct zs_pool *zs_create_pool(const char *name)
 {
 	int i;
 	struct zs_pool *pool;
@@ -1416,10 +1423,17 @@ struct zs_pool *zs_create_pool(char *name, gfp_t flags)
 		return area->vm_addr + off;
 	}
 
-	/* this object spans two pages */
-	pages[0] = page;
-	pages[1] = get_next_page(page);
-	BUG_ON(!pages[1]);
+
+	if (zs_pool_stat_create(pool, name))
+		goto err;
+
+	/*
+	 * Not critical, we still can use the pool
+	 * and user can trigger compaction manually.
+	 */
+	if (zs_register_shrinker_int(pool) == 0)
+		pool->shrinker_enabled = true;
+	return pool;
 
 	return __zs_map_object(area, pages, off, class->size);
 }

@@ -568,6 +568,18 @@ else
 KBUILD_CFLAGS	+= -O2
 endif
 
+# Disable all maybe-uninitialized warnings
+KBUILD_CFLAGS	+= $(call cc-disable-warning,maybe-uninitialized,)
+
+# Disable unused-constant-variable warnings
+KBUILD_CFLAGS	+= $(call cc-disable-warning,unused-const-variable,)
+
+# Disable format-truncation warnings
+KBUILD_CFLAGS   += $(call cc-disable-warning,format-truncation,)
+
+# Needed to unbreak GCC 7.x and above
+KBUILD_CFLAGS   += $(call cc-option,-fno-store-merging,)
+
 include $(srctree)/arch/$(SRCARCH)/Makefile
 
 ifneq ($(CONFIG_FRAME_WARN),0)
@@ -640,15 +652,6 @@ KBUILD_CFLAGS   += $(call cc-option,-fconserve-stack)
 
 # use the deterministic mode of AR if available
 KBUILD_ARFLAGS := $(call ar-option,D)
-
-# Disable all maybe-uninitialized warnings
-KBUILD_CFLAGS	+= $(call cc-disable-warning,maybe-uninitialized,)
-
-# Disable unused-constant-variable warnings
-KBUILD_CFLAGS	+= $(call cc-disable-warning,unused-const-variable,)
-
-# Needed to unbreak GCC 7.x and above
-KBUILD_CFLAGS   += $(call cc-option,-fno-store-merging,)
 
 # check for 'asm goto'
 ifeq ($(shell $(CONFIG_SHELL) $(srctree)/scripts/gcc-goto.sh $(CC)), y)

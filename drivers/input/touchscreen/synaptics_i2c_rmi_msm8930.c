@@ -24,8 +24,9 @@
 #include <linux/gpio.h>
 #include <linux/leds.h>
 #include <linux/regulator/consumer.h>
-#ifdef CONFIG_HAS_EARLYSUSPEND
-#include <linux/earlysuspend.h>
+#ifdef CONFIG_FB
+#include <linux/notifier.h>
+#include <linux/fb.h>
 #endif
 #ifdef CONFIG_MACH_JF
 #include "synaptics_i2c_rmi.h"
@@ -48,9 +49,8 @@
 #undef USE_OPEN_CLOSE
 #undef USE_SENSOR_SLEEP
 
-#if defined(CONFIG_MACH_MELIUS_CHN_CTC)
-#define GPIO_TOUCH_IRQ_CTC_REV00	18
-#endif
+#define SYNAPTICS_POWER_MARGIN_TIME	150
+#define MAX_TSP_REBOOT			3
 
 /*
 #define REPORT_2D_Z
@@ -138,16 +138,10 @@
 #define SM_FINGER_AMPLITUDE_TH_CLEAR_COVER  0x0F
 #define MINIMUM_PEAK_AMPLIYUDE_NORMAL		0x30
 #define MINIMUM_PEAK_AMPLIYUDE_CLEAR_COVER	0x10
-#define DRUMMING_ACCEL_TH_NORMAL    0x08
-#define DRUMMING_ACCEL_TH_SIP   0x04
-#define MINIMUM_DRUMMING_SEPARATION_NORMAL      0x14
-#define MINIMUM_DRUMMING_SEPARATION_SIP     0x0A
 
 #if defined(CONFIG_MACH_MELIUS)
 bool is_hover_on = false;
 #endif
-
-extern struct class *sec_class;
 
 extern int is_lcd_on;
 
@@ -161,21 +155,13 @@ static int synaptics_rmi4_i2c_write(struct synaptics_rmi4_data *rmi4_data,
 
 static int synaptics_rmi4_reinit_device(struct synaptics_rmi4_data *rmi4_data);
 
-#ifdef CONFIG_HAS_EARLYSUSPEND
-static ssize_t synaptics_rmi4_full_pm_cycle_show(struct device *dev,
-		struct device_attribute *attr, char *buf);
-
-static ssize_t synaptics_rmi4_full_pm_cycle_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count);
-
-static void synaptics_rmi4_early_suspend(struct early_suspend *h);
-
-static void synaptics_rmi4_late_resume(struct early_suspend *h);
-#else
-
+#ifdef CONFIG_FB
 static int synaptics_rmi4_suspend(struct device *dev);
 
 static int synaptics_rmi4_resume(struct device *dev);
+
+static int fb_notifier_callback(struct notifier_block *self,
+		unsigned long event, void *rmi4_data);
 #endif
 
 #ifdef PROXIMITY
@@ -217,19 +203,14 @@ static ssize_t synaptics_rmi4_0dbutton_show(struct device *dev,
 
 static ssize_t synaptics_rmi4_0dbutton_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count);
-
-static ssize_t set_tsp_for_inputmethod_show(struct device *dev,
-        struct device_attribute *attr, char *buf);
-
-static ssize_t set_tsp_for_inputmethod_store(struct device *dev,
-        struct device_attribute *attr, const char *buf, size_t size);
-
-
 #ifdef CONFIG_LEDS_CLASS
+static int tkey_led_on;
+
 static void msm_tkey_led_set(struct led_classdev *led_cdev,
 	enum led_brightness value)
 {
-	bool tkey_led_on;
+//	bool tkey_led_on;
+
 
 	struct synaptics_rmi4_data *rmi4_data =
 		container_of(led_cdev, struct synaptics_rmi4_data, leds);
@@ -613,11 +594,6 @@ struct synaptics_rmi4_exp_fn {
 };
 
 static struct device_attribute attrs[] = {
-#ifdef CONFIG_HAS_EARLYSUSPEND
-	__ATTR(full_pm_cycle, (S_IRUGO | S_IWUSR | S_IWGRP),
-			synaptics_rmi4_full_pm_cycle_show,
-			synaptics_rmi4_full_pm_cycle_store),
-#endif
 #ifdef PROXIMITY
 	__ATTR(proximity_enables, (S_IRUGO | S_IWUSR | S_IWGRP),
 			synaptics_rmi4_f51_enables_show,
@@ -646,36 +622,132 @@ static struct device_attribute attrs[] = {
 			synaptics_rmi4_0dbutton_store),
 };
 
-static DEVICE_ATTR(set_tsp_for_inputmethod, S_IRUGO | S_IWUSR | S_IWGRP, set_tsp_for_inputmethod_show, set_tsp_for_inputmethod_store); /* For 3x4 Input Method, Drumming changed API */
-
 static struct list_head exp_fn_list;
 
 #ifdef PROXIMITY
 static struct synaptics_rmi4_f51_handle *f51;
 #endif
 
-#ifdef CONFIG_HAS_EARLYSUSPEND
-static ssize_t synaptics_rmi4_full_pm_cycle_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
+#ifdef TSP_BOOSTER
+static void synaptics_change_dvfs_lock(struct work_struct *work)
 {
-	struct synaptics_rmi4_data *rmi4_data = dev_get_drvdata(dev);
+	struct synaptics_rmi4_data *rmi4_data =
+		container_of(work,
+			struct synaptics_rmi4_data, work_dvfs_chg.work);
+	int retval = 0;
 
-	return snprintf(buf, PAGE_SIZE, "%u\n",
-			rmi4_data->full_pm_cycle);
+	mutex_lock(&rmi4_data->dvfs_lock);
+
+	if (rmi4_data->dvfs_boost_mode == DVFS_STAGE_DUAL) {
+		if (rmi4_data->stay_awake) {
+			dev_info(&rmi4_data->i2c_client->dev,
+				"%s: do fw update, do not change cpu frequency.\n",
+				__func__);
+		} else {
+		retval = set_freq_limit(DVFS_TOUCH_ID,
+				MIN_TOUCH_LIMIT_SECOND);
+		rmi4_data->dvfs_freq = MIN_TOUCH_LIMIT_SECOND;
+		}
+	} else if (rmi4_data->dvfs_boost_mode == DVFS_STAGE_SINGLE) {
+		retval = set_freq_limit(DVFS_TOUCH_ID, -1);
+		rmi4_data->dvfs_freq = -1;
+	}
+
+	if (retval < 0)
+		dev_err(&rmi4_data->i2c_client->dev,
+			"%s: booster change failed(%d).\n",
+			__func__, retval);
+	mutex_unlock(&rmi4_data->dvfs_lock);
 }
 
-static ssize_t synaptics_rmi4_full_pm_cycle_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
+static void synaptics_set_dvfs_off(struct work_struct *work)
 {
-	unsigned int input;
-	struct synaptics_rmi4_data *rmi4_data = dev_get_drvdata(dev);
+	struct synaptics_rmi4_data *rmi4_data =
+		container_of(work,
+			struct synaptics_rmi4_data, work_dvfs_off.work);
+	int retval;
 
-	if (sscanf(buf, "%u", &input) != 1)
-		return -EINVAL;
+	if (rmi4_data->stay_awake) {
+		dev_info(&rmi4_data->i2c_client->dev,
+			"%s: do fw update, do not change cpu frequency.\n",
+			__func__);
+	} else {
+	mutex_lock(&rmi4_data->dvfs_lock);
 
-	rmi4_data->full_pm_cycle = input > 0 ? 1 : 0;
+	retval = set_freq_limit(DVFS_TOUCH_ID, -1);
+	rmi4_data->dvfs_freq = -1;
+	if (retval < 0)
+		dev_err(&rmi4_data->i2c_client->dev,
+			"%s: booster stop failed(%d).\n",
+			__func__, retval);
+	rmi4_data->dvfs_lock_status = false;
 
-	return count;
+	mutex_unlock(&rmi4_data->dvfs_lock);
+}
+}
+
+static void synaptics_set_dvfs_lock(struct synaptics_rmi4_data *rmi4_data,
+					int on)
+{
+	int ret = 0;
+
+	if (rmi4_data->dvfs_boost_mode == DVFS_STAGE_NONE) {
+		dev_info(&rmi4_data->i2c_client->dev,
+				"%s: DVFS stage is none(%d)\n",
+				__func__, rmi4_data->dvfs_boost_mode);
+		return;
+	}
+
+	mutex_lock(&rmi4_data->dvfs_lock);
+	if (on == 0) {
+		if (rmi4_data->dvfs_lock_status) {
+			schedule_delayed_work(&rmi4_data->work_dvfs_off,
+				msecs_to_jiffies(TOUCH_BOOSTER_OFF_TIME));
+		}
+	} else if (on > 0) {
+		cancel_delayed_work(&rmi4_data->work_dvfs_off);
+
+		if (rmi4_data->dvfs_old_stauts != on) {
+			cancel_delayed_work(&rmi4_data->work_dvfs_chg);
+			if (1/*!rmi4_data->dvfs_lock_status*/) {
+				if (rmi4_data->dvfs_freq != MIN_TOUCH_LIMIT) {
+					ret = set_freq_limit(DVFS_TOUCH_ID,
+							MIN_TOUCH_LIMIT);
+					rmi4_data->dvfs_freq = MIN_TOUCH_LIMIT;
+
+					if (ret < 0)
+						dev_err(&rmi4_data->i2c_client->dev,
+							"%s: cpu first lock failed(%d)\n",
+							__func__, ret);
+				}
+
+			schedule_delayed_work(&rmi4_data->work_dvfs_chg,
+				msecs_to_jiffies(TOUCH_BOOSTER_CHG_TIME));
+
+				rmi4_data->dvfs_lock_status = true;
+			}
+		}
+	} else if (on < 0) {
+		if (rmi4_data->dvfs_lock_status) {
+			cancel_delayed_work(&rmi4_data->work_dvfs_off);
+			cancel_delayed_work(&rmi4_data->work_dvfs_chg);
+			schedule_work(&rmi4_data->work_dvfs_off.work);
+		}
+	}
+	rmi4_data->dvfs_old_stauts = on;
+	mutex_unlock(&rmi4_data->dvfs_lock);
+}
+
+static void synaptics_init_dvfs(struct synaptics_rmi4_data *rmi4_data)
+{
+	mutex_init(&rmi4_data->dvfs_lock);
+
+	rmi4_data->dvfs_boost_mode = DVFS_STAGE_DUAL;
+
+	INIT_DELAYED_WORK(&rmi4_data->work_dvfs_off, synaptics_set_dvfs_off);
+	INIT_DELAYED_WORK(&rmi4_data->work_dvfs_chg, synaptics_change_dvfs_lock);
+
+	rmi4_data->dvfs_lock_status = false;
 }
 #endif
 
@@ -918,90 +990,6 @@ static ssize_t synaptics_rmi4_0dbutton_store(struct device *dev,
 	return count;
 }
 
-static ssize_t set_tsp_for_inputmethod_show(struct device *dev, struct device_attribute *attr, char *buf)
- {
-     struct synaptics_rmi4_data *rmi4_data = dev_get_drvdata(dev);
-
-     return snprintf(buf, PAGE_SIZE, "%u\n",
-             rmi4_data->is_inputmethod);
- }
-static ssize_t set_tsp_for_inputmethod_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
- {
-    int retval;
-    bool update_reg = false;
-    struct synaptics_rmi4_f12_ctrl_13 ctrl_13;
-    struct synaptics_rmi4_data *rmi4_data = dev_get_drvdata(dev);
-
-    if (*buf == '1' && (!rmi4_data->is_inputmethod)) {
-        dev_info(&(rmi4_data->input_dev->dev),
-            "%s: Set TSP inputmethod IN\n",
-            __func__);
-        rmi4_data->is_inputmethod = true;
-    } else if (*buf == '0' && (rmi4_data->is_inputmethod)) {
-        dev_info(&(rmi4_data->input_dev->dev),
-            "%s: Set TSP inputmethod OUT\n",
-            __func__);
-		rmi4_data->is_inputmethod = false;
-    }
-
-    /* read f12 ctrl register */
-    retval = synaptics_rmi4_i2c_read(rmi4_data,
-             0x13,
-             ctrl_13.data,
-             sizeof(ctrl_13.data));
-     
-    if (retval < 0) {
-        dev_err(&(rmi4_data->input_dev->dev),
-            "%s: Failed to read f12_ctrl_13 register \n",
-            __func__);
-        return 1;
-     } else {
-         dev_info(&rmi4_data->i2c_client->dev,
-                 "DRUM_ACC_TH[0x%x], MIN_DRUM_SEP[0x%x]\n", ctrl_13.data[3], ctrl_13.data[4]);
-    }
-
-    if (rmi4_data->is_inputmethod) {
-        if (ctrl_13.data[3] != DRUMMING_ACCEL_TH_SIP) {
-            update_reg = true;
-            ctrl_13.data[3] = DRUMMING_ACCEL_TH_SIP;
-        }
-        if (ctrl_13.data[4] != MINIMUM_DRUMMING_SEPARATION_SIP) {
-            update_reg = true;
-            ctrl_13.data[4] = MINIMUM_DRUMMING_SEPARATION_SIP;
-        }
-    } else {
-        if (ctrl_13.data[3] != DRUMMING_ACCEL_TH_NORMAL) {
-            update_reg = true;
-            ctrl_13.data[3] = DRUMMING_ACCEL_TH_NORMAL;
-        }
-        if (ctrl_13.data[4] != MINIMUM_DRUMMING_SEPARATION_NORMAL) {
-            update_reg = true;
-            ctrl_13.data[4] = MINIMUM_DRUMMING_SEPARATION_NORMAL;
-        }
-    }
-
-    if (update_reg) {
-         dev_info(&rmi4_data->i2c_client->dev,
-             "update_reg to DRUM_ACC_TH[0x%x], MIN_DRUM_SEP[0x%x]\n", ctrl_13.data[3], ctrl_13.data[4]);
-         
-         retval = synaptics_rmi4_i2c_write(rmi4_data,
-                 0x13,
-                 ctrl_13.data,
-                 sizeof(ctrl_13.data));
-     
-         if (retval < 0) {
-             dev_err(&(rmi4_data->input_dev->dev),
-                 "%s: Failed to write f12_ctrl_13\n",
-                 __func__);
-         }
-     } else {
-         dev_info(&rmi4_data->i2c_client->dev,
-                 "%s: not update !\n", __func__);
-     }
-
-     return 1;
- }
-
  /**
  * synaptics_rmi4_set_page()
  *
@@ -1084,8 +1072,10 @@ static int synaptics_rmi4_i2c_read(struct synaptics_rmi4_data *rmi4_data,
 	}
 
 	retval = synaptics_rmi4_set_page(rmi4_data, addr);
-	if (retval != PAGE_SELECT_LEN)
+	if (retval != PAGE_SELECT_LEN) {
+		retval = -EIO;
 		goto exit;
+	}
 
 	for (retry = 0; retry < SYN_I2C_RETRY_TIMES; retry++) {
 		if (i2c_transfer(rmi4_data->i2c_client->adapter, msg, 2) == 2) {
@@ -1144,8 +1134,10 @@ static int synaptics_rmi4_i2c_write(struct synaptics_rmi4_data *rmi4_data,
 	}
 
 	retval = synaptics_rmi4_set_page(rmi4_data, addr);
-	if (retval != PAGE_SELECT_LEN)
+	if (retval != PAGE_SELECT_LEN) {
+		retval = -EIO;
 		goto exit;
+	}
 
 	buf[0] = addr & MASK_8BIT;
 	memcpy(&buf[1], &data[0], length);
@@ -1273,7 +1265,6 @@ static int synaptics_rmi4_f11_abs_report(struct synaptics_rmi4_data *rmi4_data,
 
 			input_report_abs(rmi4_data->input_dev,
 					ABS_MT_POSITION_Y, y);
-						printk("[TSP] X coord %d  Y coord %d",x,y);
 #ifdef REPORT_2D_W
 			input_report_abs(rmi4_data->input_dev,
 					ABS_MT_TOUCH_MAJOR, max(wx, wy));
@@ -1400,7 +1391,6 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 					ABS_MT_POSITION_X, x);
 			input_report_abs(rmi4_data->input_dev,
 					ABS_MT_POSITION_Y, y);
-			printk("[TSP] X coord %d  Y coord %d\n",x,y);
 #ifdef REPORT_2D_W
 			input_report_abs(rmi4_data->input_dev,
 					ABS_MT_TOUCH_MAJOR, max(wx, wy));
@@ -1428,7 +1418,7 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 #endif
 
 			if (!rmi4_data->finger[finger].state) {
-#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
+#if defined(CONFIG_USE_INPUTLOCATION_FOR_ENG)
 				dev_info(&rmi4_data->i2c_client->dev, "[%d][P] 0x%02x, x = %d, y = %d, wx = %d, wy = %d\n",
 					finger, finger_status, x, y, wx, wy);
 #else
@@ -1442,14 +1432,10 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 		}
 
 		if (rmi4_data->finger[finger].state && !finger_status) {
-#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
 			dev_info(&rmi4_data->i2c_client->dev, "[%d][R] 0x%02x M[%d], ver = %02X%02X\n",
 				finger, finger_status, rmi4_data->finger[finger].mcount,
 				rmi4_data->fw_order_of_ic, rmi4_data->fw_version_of_ic);
-#else
-			dev_info(&rmi4_data->i2c_client->dev, "[%d][R] 0x%02x M[%d]\n",
-				finger, finger_status, rmi4_data->finger[finger].mcount);
-#endif
+
 			rmi4_data->finger[finger].mcount = 0;
 		}
 
@@ -1468,6 +1454,12 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 
 	input_sync(rmi4_data->input_dev);
 
+#ifdef TSP_BOOSTER
+	if (touch_count)
+		synaptics_set_dvfs_lock(rmi4_data, touch_count);
+	else
+		synaptics_set_dvfs_lock(rmi4_data, 0);
+#endif
 	return touch_count;
 }
 
@@ -1856,67 +1848,6 @@ static int synaptics_rmi4_sensor_report(struct synaptics_rmi4_data *rmi4_data)
 
 	return 0;
 }
-
-#if defined(CONFIG_MACH_MELIUS_CHN_CTC)
-
- /**
- synaptics_rmi4_tkey_senstivity_changed
- 
- */
-static int tkey_sensitivity_state;
-int synaptics_rmi4_tkey_senstivity_changed(bool on)
-{
-	int retval;
-	unsigned char s1_mask;
-	unsigned char s2_mask;  
-	static unsigned short ctrl_s1_address = 0x201;
-	static unsigned short ctrl_s2_address = 0x20b;
-
-	if (!f51){	  
-		dev_err(&f51->rmi4_data->i2c_client->dev, "%s: F51 null \n", __func__);
-		return -ENODEV;
-	}
-
-	dev_err(&f51->rmi4_data->i2c_client->dev, "%s: start, on %d, old %d  \n", __func__, on , tkey_sensitivity_state);
-
-	if(on){
-		s1_mask = 0x04;
-		s2_mask = 0x01;
-
-		retval = synaptics_rmi4_i2c_write(f51->rmi4_data, ctrl_s1_address, &s1_mask,	  sizeof(s1_mask));
-		if (retval < 0){
-			dev_err(&f51->rmi4_data->i2c_client->dev, "%s: %d problem, %d  \n", __func__,__LINE__, retval );
-			return retval;
-		}
-		retval = synaptics_rmi4_i2c_write(f51->rmi4_data, ctrl_s2_address, &s2_mask,	  sizeof(s2_mask));
-		if (retval < 0){
-			dev_err(&f51->rmi4_data->i2c_client->dev, "%s: %d problem, %d  \n", __func__,__LINE__, retval );
-			return retval;
-		}
-	}else{
-		s1_mask = 0x00;
-		s2_mask = 0x04;
-
-		retval = synaptics_rmi4_i2c_write(f51->rmi4_data, ctrl_s1_address, &s1_mask,	  sizeof(s1_mask));
-		if (retval < 0){
-			dev_err(&f51->rmi4_data->i2c_client->dev, "%s: %d problem, %d  \n", __func__,__LINE__, retval );
-			return retval;
-		}
-		retval = synaptics_rmi4_i2c_write(f51->rmi4_data, ctrl_s2_address, &s2_mask,	  sizeof(s2_mask));
-		if (retval < 0){
-			dev_err(&f51->rmi4_data->i2c_client->dev, "%s: %d problem, %d  \n", __func__,__LINE__, retval );
-			return retval;
-		}
-	}
-
-	tkey_sensitivity_state = on;
-	dev_err(&f51->rmi4_data->i2c_client->dev, "%s: end, state %d  \n", __func__, tkey_sensitivity_state);
-	
-	return retval;
-  
-}
-
-#endif
 
  /**
  * synaptics_rmi4_irq()
@@ -2524,7 +2455,6 @@ int synaptics_proximity_no_sleep_set(bool enables)
 
 	return retval;
 }
-EXPORT_SYMBOL(synaptics_proximity_no_sleep_set);
 static int synaptics_rmi4_f51_set_enables(struct synaptics_rmi4_data *rmi4_data)
 {
 	int retval;
@@ -3289,6 +3219,12 @@ static void synaptics_rmi4_release_all_finger(
 #ifdef PROXIMITY
 	rmi4_data->f51_finger = false;
 #endif
+
+#ifdef TSP_BOOSTER
+	synaptics_set_dvfs_lock(rmi4_data, -1);
+	dev_info(&rmi4_data->i2c_client->dev,
+			"%s: dvfs_lock free.\n", __func__);
+#endif
 }
 
 int synaptics_rmi4_reset_device(struct synaptics_rmi4_data *rmi4_data)
@@ -3727,16 +3663,6 @@ int synaptics_rmi4_new_function(enum exp_fn fn_type,
 	return 0;
 }
 
-static void synaptics_init_power_on(struct work_struct *work)
-{
-	struct synaptics_rmi4_data *rmi4_data =
-		container_of(work,
-			struct synaptics_rmi4_data, work_init_power_on.work);
-
-	synaptics_rmi4_late_resume(&rmi4_data->early_suspend);
-}
-
-
  /**
  * synaptics_rmi4_probe()
  *
@@ -3754,13 +3680,12 @@ static void synaptics_init_power_on(struct work_struct *work)
 static int __devinit synaptics_rmi4_probe(struct i2c_client *client,
 		const struct i2c_device_id *dev_id)
 {
-	int retval;
+	int retval, retry = 0;
 	unsigned char attr_count;
 	struct synaptics_rmi4_data *rmi4_data;
 	struct synaptics_rmi4_device_info *rmi;
 	const struct synaptics_rmi4_platform_data *platform_data =
 			client->dev.platform_data;
-	struct device *sec_touchscreen;
 	printk(KERN_ALERT"\n[TSP]inside synaptics_rmi4_probe");
 	if (!i2c_check_functionality(client->adapter,
 			I2C_FUNC_SMBUS_BYTE_DATA)) {
@@ -3795,7 +3720,6 @@ static int __devinit synaptics_rmi4_probe(struct i2c_client *client,
 	rmi4_data->irq_enabled = false;
 	rmi4_data->esd_reset = false;
     rmi4_data->touchkey_lcd_on = true;
-	rmi4_data->is_inputmethod = false;
 
 	rmi4_data->board->power(true);
 
@@ -3816,20 +3740,51 @@ static int __devinit synaptics_rmi4_probe(struct i2c_client *client,
 	INIT_DELAYED_WORK(&rmi4_data->work_rezero, synaptics_work_rezero);
 #endif
 
+#ifdef TSP_BOOSTER
+	synaptics_init_dvfs(rmi4_data);
+#endif
+
+err_tsp_query_reboot:
 	retval = synaptics_rmi4_set_input_device(rmi4_data);
 	if (retval < 0) {
 		dev_err(&client->dev,
 				"%s: Failed to register input device\n",
 				__func__);
-		goto err_set_input_device;
+		if ((retval == -EIO) && (retry < MAX_TSP_REBOOT)) {
+			rmi4_data->board->power(false);
+			msleep(SYNAPTICS_POWER_MARGIN_TIME);
+			retry++;
+			dev_err(&client->dev,
+					"%s: reboot sequence%d by i2c fail\n",
+					__func__, retry);
+			rmi4_data->board->power(true);
+			msleep(SYNAPTICS_POWER_MARGIN_TIME);
+
+			goto err_tsp_query_reboot;
+		}
+		else goto err_set_input_device;
 	}
 
+	retry = 0;
+err_tsp_reboot:
 	retval = synaptics_rmi4_init_exp_fn(rmi4_data);
 	if (retval < 0) {
 		dev_err(&client->dev,
 				"%s: Failed to register rmidev module\n",
 				__func__);
-		goto err_init_exp_fn;
+		if ((retval == -EIO) && (retry < MAX_TSP_REBOOT)) {
+			rmi4_data->board->power(false);
+			msleep(SYNAPTICS_POWER_MARGIN_TIME);
+			retry++;
+			dev_err(&client->dev,
+					"%s: reboot sequence%d by i2c fail\n",
+					__func__, retry);
+			rmi4_data->board->power(true);
+			msleep(SYNAPTICS_POWER_MARGIN_TIME);
+
+			goto err_tsp_reboot;
+		}
+		else goto err_init_exp_fn;
 	}
 
 	retval = synaptics_rmi4_irq_enable(rmi4_data, true);
@@ -3858,16 +3813,6 @@ static int __devinit synaptics_rmi4_probe(struct i2c_client *client,
 		}
 	}
 
-	sec_touchscreen = device_create(sec_class, NULL, 0, rmi4_data, "sec_touchscreen");
-	if (IS_ERR(sec_touchscreen))
-        dev_err(&client->dev,
-                "%s: Failed to create device(sec_touchscreen)!\n",
-                __func__);
-	if (device_create_file(sec_touchscreen, &dev_attr_set_tsp_for_inputmethod) < 0)
-        dev_err(&client->dev,
-                "%s: Failed to create device file(%s)\n",
-                __func__, dev_attr_set_tsp_for_inputmethod.attr.name);
-
 #ifdef CONFIG_LEDS_CLASS
 		rmi4_data->leds.name = TOUCHKEY_BACKLIGHT;
 		rmi4_data->leds.brightness = LED_FULL;
@@ -3882,11 +3827,9 @@ static int __devinit synaptics_rmi4_probe(struct i2c_client *client,
 		}
 #endif
 
-#ifdef CONFIG_HAS_EARLYSUSPEND
-	rmi4_data->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN - 1;
-	rmi4_data->early_suspend.suspend = synaptics_rmi4_early_suspend;
-	rmi4_data->early_suspend.resume = synaptics_rmi4_late_resume;
-	register_early_suspend(&rmi4_data->early_suspend);
+#ifdef CONFIG_FB
+	rmi4_data->fb_notif.notifier_call = fb_notifier_callback;
+	fb_register_client(&rmi4_data->fb_notif);
 #endif
 
     /* initialize hallsensor status */
@@ -3898,16 +3841,6 @@ static int __devinit synaptics_rmi4_probe(struct i2c_client *client,
     rmi4_data->callbacks.inform_lcd = synaptics_lcd_cb;
 	if (rmi4_data->register_cb)
 		rmi4_data->register_cb(&rmi4_data->callbacks);
-
-#ifdef CONFIG_HAS_EARLYSUSPEND
-	/* turn off TSP power. after LCD module on, TSP power will turn on */
-	synaptics_rmi4_early_suspend(&rmi4_data->early_suspend);
-
-	INIT_DELAYED_WORK(&rmi4_data->work_init_power_on,
-					synaptics_init_power_on);
-	schedule_delayed_work(&rmi4_data->work_init_power_on,
-					msecs_to_jiffies(6000));
-#endif
 
 	/* for blocking to be excuted open function until probing */
 	complete_all(&rmi4_data->init_done);
@@ -3950,6 +3883,10 @@ err_set_input_device:
 err_input_device:
 	kfree(rmi4_data);
 */
+#ifdef CONFIG_MACH_MELIUS_SPR
+	/* Add force panic when TSP driver probe fail for user-side operation */
+	panic("TSP init fail");
+#endif
 	return retval;
 }
 
@@ -3974,8 +3911,8 @@ static int __devexit synaptics_rmi4_remove(struct i2c_client *client)
 	led_classdev_unregister(&rmi4_data->leds);
 #endif
 	rmi = &(rmi4_data->rmi4_mod_info);
-#ifdef CONFIG_HAS_EARLYSUSPEND
-	unregister_early_suspend(&rmi4_data->early_suspend);
+#ifdef CONFIG_FB
+	fb_unregister_client(&rmi4_data->fb_notif);
 #endif
 
 	synaptics_rmi4_irq_enable(rmi4_data, false);
@@ -4165,107 +4102,7 @@ static void synaptics_rmi4_input_close(struct input_dev *dev)
 }
 #endif
 
-#ifdef CONFIG_HAS_EARLYSUSPEND
-#define synaptics_rmi4_suspend NULL
-#define synaptics_rmi4_resume NULL
-
- /**
- * synaptics_rmi4_early_suspend()
- *
- * Called by the kernel during the early suspend phase when the system
- * enters suspend.
- *
- * This function calls synaptics_rmi4_sensor_sleep() to stop finger
- * data acquisition and put the sensor to sleep.
- */
-static void synaptics_rmi4_early_suspend(struct early_suspend *h)
-{
-	struct synaptics_rmi4_data *rmi4_data =
-			container_of(h, struct synaptics_rmi4_data,
-			early_suspend);
-
-#if defined(CONFIG_MACH_MELIUS_CHN_CTC)
-	if(tkey_sensitivity_state)
-		synaptics_rmi4_tkey_senstivity_changed(0);
-#endif
-
-	if (rmi4_data->stay_awake) {
-		rmi4_data->staying_awake = true;
-		return;
-	} else {
-		rmi4_data->staying_awake = false;
-	}
-#ifdef CONFIG_LEDS_CLASS
-    rmi4_data->board->tkey_led_vdd_on(0);
-#endif
-	if (!rmi4_data->touch_stopped) {
-		dev_info(&rmi4_data->i2c_client->dev, "%s\n", __func__);
-
-		disable_irq(rmi4_data->i2c_client->irq);
-		rmi4_data->board->power(false);
-		rmi4_data->touch_stopped = true;
-
-		/* release all finger when entered suspend */
-		synaptics_rmi4_release_all_finger(rmi4_data);
-		rmi4_data->board->i2c_set(false);
-	}
-#if defined(CONFIG_MACH_MELIUS_CHN_CTC)
-	gpio_tlmm_config(GPIO_CFG(GPIO_TOUCH_IRQ_CTC_REV00, 0, GPIO_CFG_INPUT, GPIO_CFG_PULL_DOWN, GPIO_CFG_2MA), 1);
-#endif
-}
-
- /**
- * synaptics_rmi4_late_resume()
- *
- * Called by the kernel during the late resume phase when the system
- * wakes up from suspend.
- *
- * This function goes through the sensor wake process if the system wakes
- * up from early suspend (without going into suspend).
- */
-static void synaptics_rmi4_late_resume(struct early_suspend *h)
-{
-	struct synaptics_rmi4_data *rmi4_data =
-			container_of(h, struct synaptics_rmi4_data,
-			early_suspend);
-	int retval;
-
-	if (rmi4_data->staying_awake)
-		return;
-
-#if defined(CONFIG_MACH_MELIUS_CHN_CTC)
-	gpio_tlmm_config(GPIO_CFG(GPIO_TOUCH_IRQ_CTC_REV00, 0, GPIO_CFG_INPUT, GPIO_CFG_NO_PULL, GPIO_CFG_2MA), 1);
-#endif
-	if (rmi4_data->touch_stopped) {
-	dev_info(&rmi4_data->i2c_client->dev, "%s\n", __func__);
-
-	rmi4_data->board->i2c_set(true);
-	rmi4_data->board->power(true);
-	rmi4_data->current_page = 0xff;
-	rmi4_data->touch_stopped = false;
-	rmi4_data->is_inputmethod = false;
-
-    msleep(SYNAPTICS_HW_RESET_TIME_B0);
-
-	retval = synaptics_rmi4_reinit_device(rmi4_data);
-	if (retval < 0) {
-		dev_err(&rmi4_data->i2c_client->dev,
-				"%s: Failed to reinit device\n",
-				__func__);
-	}
-
-	if (rmi4_data->ta_status)
-		synaptics_charger_conn(rmi4_data, rmi4_data->ta_status);
-
-    if (rmi4_data->hallsensor_status == 0)
-        synaptics_hallsensor_conn(rmi4_data, rmi4_data->hallsensor_status);
-
-	enable_irq(rmi4_data->i2c_client->irq);
-	}
-	return;
-}
-#else
-
+#ifdef CONFIG_FB
  /**
  * synaptics_rmi4_suspend()
  *
@@ -4347,12 +4184,49 @@ static int synaptics_rmi4_resume(struct device *dev)
 
 	return 0;
 }
+
+static int fb_notifier_callback(struct notifier_block *self,
+				unsigned long event, void *data)
+{
+	struct fb_event *evdata = data;
+	int *blank;
+	int new_status;
+	struct synaptics_rmi4_data *synaptics_rmi4_ts_data = container_of(self, struct synaptics_rmi4_data, fb_notif);
+
+	if (evdata && evdata->data && data && synaptics_rmi4_ts_data->i2c_client) {
+		blank = evdata->data;
+		switch (*blank) {
+			case FB_BLANK_UNBLANK:
+			case FB_BLANK_NORMAL:
+			case FB_BLANK_VSYNC_SUSPEND:
+			case FB_BLANK_HSYNC_SUSPEND:
+				new_status = 0;
+				break;
+			default:
+			case FB_BLANK_POWERDOWN:
+				new_status = 1;
+				break;
+		}
+
+		if (event == FB_EVENT_BLANK) {
+			if (!new_status)
+				synaptics_rmi4_resume(&synaptics_rmi4_ts_data->i2c_client->dev);
+			else
+				synaptics_rmi4_suspend(&synaptics_rmi4_ts_data->i2c_client->dev);
+		}
+	}
+
+	return 0;
+}
 #endif
-		
-#ifdef CONFIG_PM
+
+#if (!defined(CONFIG_FB) && !defined(CONFIG_HAS_EARLYSUSPEND))
 static const struct dev_pm_ops synaptics_rmi4_dev_pm_ops = {
 	.suspend = synaptics_rmi4_suspend,
 	.resume  = synaptics_rmi4_resume,
+};
+#else
+static const struct dev_pm_ops synaptics_rmi4_dev_pm_ops = {
 };
 #endif
 
